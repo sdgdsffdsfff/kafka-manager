@@ -11,6 +11,7 @@ import java.util.concurrent.{LinkedBlockingQueue, TimeUnit, ThreadPoolExecutor}
 import akka.pattern._
 import akka.actor.{Props, ActorPath}
 import ActorModel.CMShutdown
+import kafka.manager.features.ClusterFeatures
 import org.apache.curator.framework.CuratorFramework
 import org.apache.curator.framework.recipes.cache.{PathChildrenCacheEvent, PathChildrenCacheListener, PathChildrenCache}
 import org.apache.curator.framework.recipes.cache.PathChildrenCache.StartMode
@@ -81,18 +82,33 @@ object ClusterConfig {
     require(zkHosts.length > 0, "cluster zk hosts is illegal, can't be empty!")
   }
 
-  def apply(name: String, version : String, zkHosts: String, zkMaxRetry: Int = 100, jmxEnabled: Boolean) : ClusterConfig = {
+  def apply(name: String,
+            version : String,
+            zkHosts: String,
+            zkMaxRetry: Int = 100,
+            jmxEnabled: Boolean,
+            filterConsumers: Boolean,
+            logkafkaEnabled: Boolean = false, 
+            activeOffsetCacheEnabled: Boolean = false) : ClusterConfig = {
     val kafkaVersion = KafkaVersion(version)
     //validate cluster name
     validateName(name)
     //validate zk hosts
     validateZkHosts(zkHosts)
     val cleanZkHosts = zkHosts.replaceAll(" ","")
-    new ClusterConfig(name, CuratorConfig(cleanZkHosts, zkMaxRetry), true, kafkaVersion, jmxEnabled)
+    new ClusterConfig(
+      name, 
+      CuratorConfig(cleanZkHosts, zkMaxRetry), 
+      true, 
+      kafkaVersion, 
+      jmxEnabled, 
+      filterConsumers, 
+      logkafkaEnabled, 
+      activeOffsetCacheEnabled)
   }
 
-  def customUnapply(cc: ClusterConfig) : Option[(String, String, String, Int, Boolean)] = {
-    Some((cc.name, cc.version.toString, cc.curatorConfig.zkConnect, cc.curatorConfig.zkMaxRetry, cc.jmxEnabled))
+  def customUnapply(cc: ClusterConfig) : Option[(String, String, String, Int, Boolean, Boolean, Boolean, Boolean)] = {
+    Some((cc.name, cc.version.toString, cc.curatorConfig.zkConnect, cc.curatorConfig.zkMaxRetry, cc.jmxEnabled, cc.filterConsumers, cc.logkafkaEnabled, cc.activeOffsetCacheEnabled))
   }
 
   import scalaz.{Failure,Success}
@@ -123,6 +139,9 @@ object ClusterConfig {
       :: ("enabled" -> toJSON(config.enabled))
       :: ("kafkaVersion" -> toJSON(config.version.toString))
       :: ("jmxEnabled" -> toJSON(config.jmxEnabled))
+      :: ("filterConsumers" -> toJSON(config.filterConsumers))
+      :: ("logkafkaEnabled" -> toJSON(config.logkafkaEnabled))
+      :: ("activeOffsetCacheEnabled" -> toJSON(config.activeOffsetCacheEnabled))
       :: Nil)
     compact(render(json)).getBytes(StandardCharsets.UTF_8)
   }
@@ -137,7 +156,17 @@ object ClusterConfig {
           val versionString = field[String]("kafkaVersion")(json)
           val version = versionString.map(KafkaVersion.apply).getOrElse(Kafka_0_8_1_1)
           val jmxEnabled = field[Boolean]("jmxEnabled")(json)
-          ClusterConfig.apply(name,curatorConfig,enabled,version,jmxEnabled.getOrElse(false))
+          val filterConsumers = field[Boolean]("filterConsumers")(json)
+          val logkafkaEnabled = field[Boolean]("logkafkaEnabled")(json)
+          val activeOffsetCacheEnabled = field[Boolean]("activeOffsetCacheEnabled")(json)
+          ClusterConfig.apply(
+            name,
+            curatorConfig,
+            enabled,version,
+            jmxEnabled.getOrElse(false),
+            filterConsumers.getOrElse(true),
+            logkafkaEnabled.getOrElse(false), 
+            activeOffsetCacheEnabled.getOrElse(false))
       }
 
       result match {
@@ -152,7 +181,15 @@ object ClusterConfig {
 
 }
 
-case class ClusterConfig (name: String, curatorConfig : CuratorConfig, enabled: Boolean, version: KafkaVersion, jmxEnabled: Boolean)
+case class ClusterContext(clusterFeatures: ClusterFeatures, config: ClusterConfig)
+case class ClusterConfig (name: String,
+                          curatorConfig : CuratorConfig,
+                          enabled: Boolean,
+                          version: KafkaVersion,
+                          jmxEnabled: Boolean,
+                          filterConsumers: Boolean,
+                          logkafkaEnabled: Boolean,
+                          activeOffsetCacheEnabled: Boolean)
 
 object KafkaManagerActor {
   val ZkRoot : String = "/kafka-manager"
@@ -175,7 +212,11 @@ case class KafkaManagerActorConfig(curatorConfig: CuratorConfig,
                                    maxQueueSize: Int = 100,
                                    kafkaManagerUpdatePeriod: FiniteDuration = 10 seconds,
                                    deleteClusterUpdatePeriod: FiniteDuration = 10 seconds,
-                                   deletionBatchSize : Int = 2)
+                                   deletionBatchSize : Int = 2,
+                                   clusterActorsAskTimeoutMillis: Int = 2000,
+                                   partitionOffsetCacheTimeoutSecs: Int = 5,
+                                   simpleConsumerSocketTimeoutMillis : Int = 10000
+                                    )
 class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
   extends BaseQueryCommandActor with CuratorAwareActor with BaseZkPath {
 
@@ -528,7 +569,13 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
           getClusterZkPath(config),
           kafkaManagerConfig.curatorConfig,
           config,
-          kafkaManagerConfig.brokerViewUpdatePeriod)
+          kafkaManagerConfig.brokerViewUpdatePeriod,
+          threadPoolSize = kafkaManagerConfig.threadPoolSize,
+          maxQueueSize = kafkaManagerConfig.maxQueueSize,
+          askTimeoutMillis = kafkaManagerConfig.clusterActorsAskTimeoutMillis,
+          mutexTimeoutMillis = kafkaManagerConfig.mutexTimeoutMillis,
+          partitionOffsetCacheTimeoutSecs = kafkaManagerConfig.partitionOffsetCacheTimeoutSecs,
+          simpleConsumerSocketTimeoutMillis = kafkaManagerConfig.simpleConsumerSocketTimeoutMillis)
         val props = Props(classOf[ClusterManagerActor], clusterManagerConfig)
         val newClusterManager = context.actorOf(props, config.name).path
         clusterConfigMap += (config.name -> config)
@@ -544,7 +591,10 @@ class KafkaManagerActor(kafkaManagerConfig: KafkaManagerActorConfig)
       if(newConfig.curatorConfig.zkConnect == currentConfig.curatorConfig.zkConnect
         && newConfig.enabled == currentConfig.enabled
         && newConfig.version == currentConfig.version
-        && newConfig.jmxEnabled == currentConfig.jmxEnabled) {
+        && newConfig.jmxEnabled == currentConfig.jmxEnabled
+        && newConfig.logkafkaEnabled == currentConfig.logkafkaEnabled
+        && newConfig.filterConsumers == currentConfig.filterConsumers
+        && newConfig.activeOffsetCacheEnabled == currentConfig.activeOffsetCacheEnabled) {
         //nothing changed
         false
       } else {
